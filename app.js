@@ -1,9 +1,8 @@
 'use strict';
 
 let throng = require('throng');
-let WORKERS = process.env.WEB_CONCURRENCY || 1;
-let port = process.env.PORT || 3000;
-
+let WORKERS = parseInt(process.env.WEB_CONCURRENCY || 1, 10);
+let port = parseInt(process.env.PORT || 3000, 10);
 
 if (require.main === module) {
   throng(start, {
