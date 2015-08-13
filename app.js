@@ -3,6 +3,7 @@
 let throng = require('throng');
 let WORKERS = parseInt(process.env.WEB_CONCURRENCY || 1, 10);
 let port = parseInt(process.env.PORT || 3000, 10);
+let redis = require('redis-url').connect(process.env.REDIS_URL);
 
 if (require.main === module) {
   throng(start, {
@@ -23,9 +24,20 @@ function start() {
   let urlUtil = require('url');
   let StatsD = require('node-statsd');
   let basicAuth = require('basic-auth');
-  let statsd = new StatsD(parseStatsdUrl(process.env.STATSD_URL));
   let app = module.exports = express();
+  let limiter = require('express-limiter')(app, redis);
+  let statsd = new StatsD(parseStatsdUrl(process.env.STATSD_URL));
   let allowedApps = loadAllowedAppsFromEnv();
+
+  limiter({
+    path: '/',
+    method: 'post',
+    lookup: ['connection.remoteAddress'],
+    // requests per min
+    total: 1000,
+    expire: 1000 * 60,
+    skipHeaders: true
+  })
 
   if (process.env.DEBUG) {
     console.log('Allowed apps', allowedApps);
