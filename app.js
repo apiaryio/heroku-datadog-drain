@@ -4,6 +4,8 @@ let throng = require('throng');
 let WORKERS = parseInt(process.env.WEB_CONCURRENCY || 1, 10);
 let port = parseInt(process.env.PORT || 3000, 10);
 let redis = require('redis-url').connect(process.env.REDIS_URL);
+let TOTAL_REQ = parseInt(process.env.TOTAL_REQ || 1000, 10);
+let EXPIRE_REQ = parseInt(process.env.EXPIRE_REQ || (1000 * 60), 10);
 
 if (require.main === module) {
   throng(start, {
@@ -34,8 +36,8 @@ function start() {
     method: 'post',
     lookup: ['connection.remoteAddress'],
     // requests per min
-    total: 1000,
-    expire: 1000 * 60,
+    total: TOTAL_REQ,
+    expire: EXPIRE_REQ,
     skipHeaders: true
   })
 
