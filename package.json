@@ -20,9 +20,11 @@
     "babel": "^5.0.2",
     "basic-auth": "^1.0.0",
     "express": "^4.12.3",
+    "express-limiter": "^1.4.0",
     "lodash": "^3.6.0",
     "logfmt": "^1.2.0",
     "node-statsd": "^0.1.1",
+    "redis-url": "^1.2.1",
     "throng": "^1.0.0",
     "through": "^2.3.6"
   },
