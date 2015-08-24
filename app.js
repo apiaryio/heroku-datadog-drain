@@ -72,6 +72,7 @@ function start() {
               console.error('Redis del error:', err);
             }
           });
+          return next();
         } else {
           redis.incr(key, function (err) {
             if (process.env.DEBUG) {
@@ -83,10 +84,11 @@ function start() {
               }
             });
           });
+          return next();
         }
       });
     }
-    next();
+
   });
 
   app.post('/', function (req, res) {
