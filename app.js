@@ -6,10 +6,10 @@ const WORKERS = parseInt(process.env.WEB_CONCURRENCY || 1, 10);
 const port = parseInt(process.env.PORT || 3000, 10);
 
 if (process.env.REDIS_URL) {
-  let redis = require('redis-url').connect(process.env.REDIS_URL);
+  var redis = require('redis-url').connect(process.env.REDIS_URL);
 }
 else{
-  let redis = false;
+  var redis = false;
 }
 
 const LIMIT_REQ = parseInt(process.env.LIMIT_REQ || 5, 10);
