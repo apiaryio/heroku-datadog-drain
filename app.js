@@ -4,8 +4,8 @@ let throng = require('throng');
 let WORKERS = parseInt(process.env.WEB_CONCURRENCY || 1, 10);
 let port = parseInt(process.env.PORT || 3000, 10);
 let redis = require('redis-url').connect(process.env.REDIS_URL);
-let TOTAL_REQ = parseInt(process.env.TOTAL_REQ || 1000, 10);
-let EXPIRE_REQ = parseInt(process.env.EXPIRE_REQ || (1000 * 60), 10);
+let LIMIT_REQ = parseInt(process.env.LIMIT_REQ || 5, 10);
+let EXPIRE_REQ = parseInt(process.env.EXPIRE_REQ || 10, 10);
 
 if (require.main === module) {
   throng(start, {
@@ -27,19 +27,8 @@ function start() {
   let StatsD = require('node-statsd');
   let basicAuth = require('basic-auth');
   let app = module.exports = express();
-  let limiter = require('express-limiter')(app, redis);
   let statsd = new StatsD(parseStatsdUrl(process.env.STATSD_URL));
   let allowedApps = loadAllowedAppsFromEnv();
-
-  limiter({
-    path: '/',
-    method: 'post',
-    lookup: ['connection.remoteAddress'],
-    // requests per min
-    total: TOTAL_REQ,
-    expire: EXPIRE_REQ,
-    skipHeaders: true
-  })
 
   if (process.env.DEBUG) {
     console.log('Allowed apps', allowedApps);
@@ -53,6 +42,7 @@ function start() {
     if (app !== undefined && app.password === auth.pass) {
       req.defaultTags = app.tags;
       req.prefix = app.prefix;
+      req.appName = auth.name;
       next();
     } else {
       res.status(401).send('Unauthorized');
@@ -61,12 +51,52 @@ function start() {
       }
     }
   });
-
-  app.post('/', function (req, res) {
-    if(req.body !== undefined) {
-      req.body.pipe(through(line => processLine(line, req.prefix, req.defaultTags)));
+  app.use(function floodProtection(req, res, next) {
+    if (process.env.FLOOD_PROTECTION === undefined) return next();
+    var key = req.appName;
+    if (process.env.DEBUG) {
+      console.log('Protection for app: ', key);
+    }
+    if (key !== undefined) {
+      redis.get(key, function (err, buffer) {
+        if (err) {
+          if (process.env.DEBUG) {
+            console.error('Redis get error:', err);
+          }
+          return next();
+        }
+        if (buffer >= LIMIT_REQ) {
+          req.floodProtectionOff = 1;
+          redis.del(key, function (err) {
+            if (process.env.DEBUG) {
+              console.error('Redis del error:', err);
+            }
+          });
+          return next();
+        } else {
+          redis.incr(key, function (err) {
+            if (process.env.DEBUG) {
+              console.error('Redis incr error:', err);
+            }
+            redis.expire(key, EXPIRE_REQ, function (err) {
+              if (process.env.DEBUG) {
+                console.error('Redis expire error:', err);
+              }
+            });
+          });
+          return next();
+        }
+      });
     }
 
+  });
+
+  app.post('/', function (req, res) {
+    if (req.body !== undefined || process.env.FLOOD_PROTECTION !== undefined) {
+      if (req.floodProtection !== 1) {
+        req.body.pipe(through(line => processLine(line, req.prefix, req.defaultTags)));
+      }
+    }
     res.send('OK');
   });
 
