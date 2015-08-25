@@ -1,11 +1,25 @@
 'use strict';
 
 let throng = require('throng');
-let WORKERS = parseInt(process.env.WEB_CONCURRENCY || 1, 10);
-let port = parseInt(process.env.PORT || 3000, 10);
-let redis = require('redis-url').connect(process.env.REDIS_URL);
-let LIMIT_REQ = parseInt(process.env.LIMIT_REQ || 5, 10);
-let EXPIRE_REQ = parseInt(process.env.EXPIRE_REQ || 10, 10);
+
+const WORKERS = parseInt(process.env.WEB_CONCURRENCY || 1, 10);
+const port = parseInt(process.env.PORT || 3000, 10);
+
+if (process.env.REDIS_URL) {
+  let redis = require('redis-url').connect(process.env.REDIS_URL);
+}
+else{
+  let redis = false;
+}
+
+const LIMIT_REQ = parseInt(process.env.LIMIT_REQ || 5, 10);
+const EXPIRE_REQ = parseInt(process.env.EXPIRE_REQ || 10, 10);
+
+const DEBUG = !!parseInt(process.env.DEBUG, 10);
+const FLOOD_PROTECTION = !!parseInt(process.env.FLOOD_PROTECTION, 10);
+
+const DIGIT_REG_EXP = /[\d\.]+/;
+const UNDERSCORE_REG_EXP = /_/g;
 
 if (require.main === module) {
   throng(start, {
@@ -30,12 +44,15 @@ function start() {
   let statsd = new StatsD(parseStatsdUrl(process.env.STATSD_URL));
   let allowedApps = loadAllowedAppsFromEnv();
 
-  if (process.env.DEBUG) {
+  function startsWithSampleSharp (_, key) {
+    return key.startsWith('sample#');
+  };
+
+  if (DEBUG) {
     console.log('Allowed apps', allowedApps);
     statsd.send = wrap(statsd.send.bind(statsd), console.log.bind(null, 'Intercepted: statsd.send(%s):'));
   }
 
-  app.use(logfmt.bodyParserStream());
   app.use(function authenticate (req, res, next) {
     let auth = basicAuth(req) || {};
     let app = allowedApps[auth.name];
@@ -46,40 +63,40 @@ function start() {
       next();
     } else {
       res.status(401).send('Unauthorized');
-      if (process.env.DEBUG) {
+      if (DEBUG) {
         console.log('Unauthorized access by %s', auth.name);
       }
     }
   });
+
   app.use(function floodProtection(req, res, next) {
-    if (process.env.FLOOD_PROTECTION === undefined) return next();
-    var key = req.appName;
-    if (process.env.DEBUG) {
-      console.log('Protection for app: ', key);
+    if (!FLOOD_PROTECTION) return next();
+    if (DEBUG) {
+      console.log('Protection for app: ', req.appName);
     }
-    if (key !== undefined) {
-      redis.get(key, function (err, buffer) {
+    if (req.appName !== undefined && redis !== false) {
+      redis.get(req.appName, function (err, buffer) {
         if (err) {
-          if (process.env.DEBUG) {
+          if (DEBUG) {
             console.error('Redis get error:', err);
           }
           return next();
         }
         if (buffer >= LIMIT_REQ) {
-          req.floodProtectionOff = 1;
-          redis.del(key, function (err) {
-            if (process.env.DEBUG) {
+          req.floodProtectionOff = true;
+          redis.del(req.appName, function (err) {
+            if (DEBUG) {
               console.error('Redis del error:', err);
             }
           });
           return next();
         } else {
-          redis.incr(key, function (err) {
-            if (process.env.DEBUG) {
+          redis.incr(req.appName, function (err) {
+            if (DEBUG) {
               console.error('Redis incr error:', err);
             }
-            redis.expire(key, EXPIRE_REQ, function (err) {
-              if (process.env.DEBUG) {
+            redis.expire(req.appName, EXPIRE_REQ, function (err) {
+              if (DEBUG) {
                 console.error('Redis expire error:', err);
               }
             });
@@ -88,22 +105,40 @@ function start() {
         }
       });
     }
+    else {
+      next();
+    }
 
   });
 
-  app.post('/', function (req, res) {
-    if (req.body !== undefined || process.env.FLOOD_PROTECTION !== undefined) {
-      if (req.floodProtection !== 1) {
-        req.body.pipe(through(line => processLine(line, req.prefix, req.defaultTags)));
+  app.use('/', function (req, res, next) {
+    if (FLOOD_PROTECTION) {
+      if (req.floodProtectionOff !== true) {
+        return req.once('end', function () {
+          res.send('OK');
+        });
       }
     }
-    res.send('OK');
+    next();
+  });
+
+  app.post('/', logfmt.bodyParserStream(), function (req, res) {
+    req.once('end', function () {
+      res.send('OK');
+    });
+
+    if (req.body) {
+      req.body.pipe(
+        through(function (line) {
+          processLine(line, req.prefix, req.defaultTags);
+        })
+      );
+    }
   });
 
   app.listen(port, function () {
     console.log('Server listening on port ' + port);
   });
-
 
   /**
    * Matches a line against a rule and processes it
@@ -111,23 +146,26 @@ function start() {
    */
   function processLine (line, prefix, defaultTags) {
     // Dyno metrics
+    if (DEBUG) {
+      console.log('Line:', line);
+    }
     if (hasKeys(line, ['heroku', 'source', 'dyno'])) {
-      if (process.env.DEBUG) {
+      if (DEBUG) {
         console.log('Processing dyno metrics');
       }
       let tags = tagsToArr({ dyno: line.source });
       tags = _.union(tags, defaultTags);
-      let metrics = _.pick(line, (_, key) => key.startsWith('sample#'));
+      let metrics = _.pick(line, startsWithSampleSharp);
       _.forEach(metrics, function (value, key) {
         key = key.split('#')[1];
-        key = key.replace(/_/g, '.');
+        key = key.replace(UNDERSCORE_REG_EXP, '.');
         statsd.histogram(prefix + 'heroku.dyno.' + key, extractNumber(value), tags);
       });
     }
 
     // Router metrics
     else if (hasKeys(line, ['heroku', 'router', 'path', 'method', 'dyno', 'status', 'connect', 'service', 'at'])) {
-      if (process.env.DEBUG) {
+      if (DEBUG) {
         console.log('Processing router metrics');
       }
       let tags = tagsToArr(_.pick(line, ['dyno', 'method', 'status', 'path', 'host', 'code', 'desc', 'at']));
@@ -141,12 +179,12 @@ function start() {
 
     // Postgres metrics
     else if (hasKeys(line, ['source', 'heroku-postgres'])) {
-      if (process.env.DEBUG) {
+      if (DEBUG) {
         console.log('Processing postgres metrics');
       }
       let tags = tagsToArr({ source: line.source });
       tags = _.union(tags, defaultTags);
-      let metrics = _.pick(line, (_, key) => key.startsWith('sample#'));
+      let metrics = _.pick(line, startsWithSampleSharp);
       _.forEach(metrics, function (value, key) {
         key = key.split('#')[1];
         statsd.histogram(prefix + 'heroku.postgres.' + key, extractNumber(value), tags);
@@ -156,7 +194,7 @@ function start() {
 
     // Scaling event
     else if (line.api === true && line.Scale === true) {
-      if (process.env.DEBUG) {
+      if (DEBUG) {
         console.log('Processing scaling metrics');
       }
       let tags = defaultTags;
@@ -169,7 +207,7 @@ function start() {
 
     // Default
     else {
-      if (process.env.DEBUG) {
+      if (DEBUG) {
         console.log('No match for line');
       }
     }
@@ -239,11 +277,11 @@ function start() {
   }
 
   /**
-   * 
+   *
    */
   function extractNumber (string) {
     if (typeof string === 'string') {
-      var match = string.match(/[\d\.]+/);
+      var match = string.match(DIGIT_REG_EXP);
       if (match !== null && match.length > 0) {
         return Number(match[0]);
       }
