@@ -31,10 +31,11 @@ if (require.main === module) {
 }
 
 function start() {
-  console.log("Running start function");
+  console.log('Running start function');
   let _ = require('lodash');
   let assert = require('assert');
   let app = module.exports = require('express')();
+  let bodyParser = require('body-parser');
   let through = require('through');
   let logfmt = require('logfmt');
   let urlUtil = require('url');
@@ -42,6 +43,10 @@ function start() {
   let basicAuth = require('basic-auth');
   let statsd = new StatsD(parseStatsdUrl(process.env.STATSD_URL));
   let allowedApps = loadAllowedAppsFromEnv();
+
+  app.disable('x-powered-by');
+  app.disable('query parser');
+  app.disable('etag');
 
   function startsWithSampleSharp (_, key) {
     return key.startsWith('sample#');
@@ -53,6 +58,9 @@ function start() {
   }
 
   const routerMetricsKeys = ['dyno', 'method', 'status', 'path', 'host', 'code', 'desc', 'at'];
+  const herokuRouterKeys = ['heroku', 'router', 'path', 'method', 'dyno', 'status', 'connect', 'service', 'at'];
+  const herokuDynoKeys = ['heroku', 'source', 'dyno'];
+  const postgresKeys = ['source', 'heroku-postgres'];
 
   let metricsVariants = {
     dynoMetrics: function (line, prefix, defaultTags) {
@@ -71,8 +79,7 @@ function start() {
     },
     postgresMetrics: function (line, prefix, defaultTags) {
       let tags = _.union(tagsToArr({ source: line.source }), defaultTags);
-      let metrics = _.pick(line, startsWithSampleSharp);
-      _.forEach(metrics, function (value, key) {
+      _.forEach(_.pick(line, startsWithSampleSharp), function (value, key) {
         statsd.histogram(prefix + 'heroku.postgres.' + key.split('#')[1], extractNumber(value), tags);
         // TODO: Use statsd counters or gauges for some postgres metrics (db size, table count, ..)
       });
@@ -95,19 +102,19 @@ function start() {
     }
   });
 
-  app.use(logfmt.bodyParserStream());
+  app.use(bodyParser.text({
+    'type': 'application/logplex-1',
+    'limit': null
+  }));
+  // app.use(logfmt.bodyParser());
 
   app.post('/', function (req, res) {
-    if (req.body) {
-      req.body.pipe(
-        through(function (line) {
-          processLine(req.appName, line, req.prefix, req.defaultTags);
-        })
-      );
+    if (req.body && 'string' === typeof req.body) {
+      req.body.trim().split('\n').forEach(function (line) {
+        processLine(req.appName, logfmt.parse(line), req.prefix, req.defaultTags);
+      });
     }
-    req.once('end', function() {
-      res.send('OK');
-    });
+    res.status(200).send('OK');
   });
 
   app.listen(port, function () {
@@ -115,9 +122,9 @@ function start() {
   });
 
 
-  function floodProtected (variant, appNameKey, line, prefix, defaultTags) {
+  function floodProtected (variant, appNameKey, ...args) {
     if (!FLOOD_PROTECTION) {
-      return metricsVariants[variant](line, prefix, defaultTags);
+      return metricsVariants[variant](...args);
     }
     if (DEBUG) {
       console.log('Protection for app: ', appNameKey);
@@ -125,26 +132,26 @@ function start() {
     if (appNameKey !== undefined && redis !== false) {
       redis.get(appNameKey + '.' + variant, function (err, buffer) {
         if (err) {
-          if (DEBUG) {
+          if (err && DEBUG) {
             console.error('Redis get error:', err);
           }
-          return metricsVariants[variant](line, prefix, defaultTags);
+          return metricsVariants[variant](...args);
         }
         if (buffer >= LIMIT_REQ) {
           redis.del(appNameKey + '.' + variant, function (err) {
-            if (DEBUG) {
+            if (err && DEBUG) {
               console.error('Redis del error:', err);
             }
           });
           // flood-gate is open
-          return metricsVariants[variant](line, prefix, defaultTags);
+          return metricsVariants[variant](...args);
         } else {
           redis.incr(appNameKey + '.' + variant, function (err) {
-            if (DEBUG) {
+            if (err && DEBUG) {
               console.error('Redis incr error:', err);
             }
             redis.expire(appNameKey + '.' + variant, EXPIRE_REQ, function (err) {
-              if (DEBUG) {
+              if (err && DEBUG) {
                 console.error('Redis expire error:', err);
               }
             });
@@ -155,7 +162,7 @@ function start() {
       });
     }
     else {
-      metricsVariants[variant](line, prefix, defaultTags);
+      metricsVariants[variant](...args);
     }
   }
 
@@ -165,7 +172,7 @@ function start() {
    */
   function processLine (appName, line, prefix, defaultTags) {
     // Dyno metrics
-    if (hasKeys(line, ['heroku', 'source', 'dyno'])) {
+    if (hasKeys(line, herokuDynoKeys)) {
       if (DEBUG) {
         console.log('Processing dyno metrics');
       }
@@ -173,7 +180,7 @@ function start() {
     }
 
     // Router metrics
-    else if (hasKeys(line, ['heroku', 'router', 'path', 'method', 'dyno', 'status', 'connect', 'service', 'at'])) {
+    else if (hasKeys(line, herokuRouterKeys)) {
       if (DEBUG) {
         console.log('Processing router metrics');
       }
@@ -181,7 +188,7 @@ function start() {
     }
 
     // Postgres metrics
-    else if (hasKeys(line, ['source', 'heroku-postgres'])) {
+    else if (hasKeys(line, postgresKeys)) {
       if (DEBUG) {
         console.log('Processing postgres metrics');
       }
@@ -196,8 +203,8 @@ function start() {
       // we do not want to floodProtect scaling event
       let tags = defaultTags;
       _.forEach(line, function (value, key) {
-        if (value !== true && parseInt(value)) {
-            statsd.gauge(prefix + 'heroku.dyno.' + key, parseInt(value), tags);
+        if (value !== true && parseInt(value, 10)) {
+          statsd.gauge(prefix + 'heroku.dyno.' + key, parseInt(value, 10), tags);
         }
       });
     }
@@ -236,11 +243,18 @@ function start() {
     return _.transform(tags, function (arr, value, key) { return arr.push(key + ':' + value); }, []);
   }
 
+  let hasProp = {}.hasOwnProperty;
+
   /**
    * Check if object contains list of keys
    */
-  function hasKeys (object, keys) {
-    return _.every(keys, _.partial(_.has, object));
+  function hasKeys (object = {}, keys = []) {
+    for (let prop of keys) {
+      if (!hasProp.call(object, prop)) {
+        return false;
+      }
+    }
+    return true;
   }
 
   /**
